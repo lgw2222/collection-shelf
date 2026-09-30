@@ -3,12 +3,14 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>Nick's Collection — Card Room</title>
+<title>Nic's Collection — Card Room</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&family=VT323&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-database-compat.js"></script>
 <style>
 :root{
   --ink:#20204a;
@@ -194,6 +196,10 @@ html,body{margin:0;padding:0;height:100%;background:var(--bg);overflow:hidden;
 #needs .fill{display:block;height:100%}
 #fade{position:absolute;inset:0;background:#0a0a14;opacity:0;pointer-events:none;transition:opacity .4s;z-index:8}
 #fade.on{opacity:1}
+#hud #sync{font-family:'Press Start 2P';font-size:6px;padding:2px 4px;border:1px solid rgba(255,255,255,.4);margin-left:8px;text-shadow:1px 1px 0 #000}
+#hud #sync[data-s=synced]{color:#8ff08f;border-color:#8ff08f}
+#hud #sync[data-s=offline],#hud #sync[data-s=local]{color:#ffbf7f;border-color:#ffbf7f}
+#washCanvas{width:100%;max-width:340px;border:3px solid var(--ink);image-rendering:pixelated;cursor:crosshair;touch-action:none;display:block;margin:0 auto}
 </style>
 </head>
 <body>
@@ -201,7 +207,7 @@ html,body{margin:0;padding:0;height:100%;background:var(--bg);overflow:hidden;
 <div id="stage">
   <div id="screen">
     <canvas id="game" width="224" height="192"></canvas>
-    <div id="hud"><span class="l" id="hudTitle">NICK'S COLLECTION</span><span class="r" id="hudCount"></span></div>
+    <div id="hud"><span class="l" id="hudTitle">NIC'S COLLECTION</span><span class="r" id="hudCount"></span><span id="sync" data-s="local">local</span></div>
     <div id="needs"></div>
     <div id="fade"></div>
     <div id="prompt" class="pixel"></div>
@@ -256,6 +262,18 @@ html,body{margin:0;padding:0;height:100%;background:var(--bg);overflow:hidden;
   </div>
 </div>
 
+<!-- pressure washer mini-game -->
+<div class="overlay" id="washOverlay">
+  <div class="win sm">
+    <div class="win-title pixel">PRESSURE WASHER 3000 <span class="sp"><button class="rbtn x red" id="washClose">✕</button></span></div>
+    <div class="win-body" style="text-align:center">
+      <div class="pixel" id="washPct" style="font-size:12px;margin-bottom:8px">0% CLEAN</div>
+      <canvas id="washCanvas" width="300" height="200"></canvas>
+      <div class="hint" style="margin-top:8px">Hold &amp; drag on the grime to blast it off. Get it spotless!</div>
+    </div>
+  </div>
+</div>
+
 <!-- generic modal -->
 <div class="overlay" id="modal">
   <div class="win sm" id="dialog">
@@ -271,6 +289,25 @@ html,body{margin:0;padding:0;height:100%;background:var(--bg);overflow:hidden;
 
 <script>
 "use strict";
+/* ============================================================
+   FIREBASE LIVE SYNC — shared collection for you + Nic.
+   Paste your project's config below (same project as your other
+   apps: yugioh-79c91). Copy the whole config object from the
+   Firebase console, or from your YADM app, and replace the
+   PASTE_... values. Leave apiKey as PASTE_... to run local-only.
+   Also make sure the Realtime Database rules allow read+write on
+   the "nickCollection" path.
+   ============================================================ */
+const FIREBASE_CONFIG = {
+  apiKey: "PASTE_YOUR_API_KEY_HERE",
+  authDomain: "yugioh-79c91.firebaseapp.com",
+  databaseURL: "https://yugioh-79c91-default-rtdb.firebaseio.com",
+  projectId: "yugioh-79c91",
+  storageBucket: "yugioh-79c91.appspot.com",
+  messagingSenderId: "PASTE_SENDER_ID",
+  appId: "PASTE_APP_ID"
+};
+const SYNC_PATH = "nickCollection";
 /* =========================================================================
    THE COLLECTION — Card Room
    A Pokemon-style room you walk around. Walk to the bookcase (press A / tap)
@@ -300,7 +337,7 @@ const NICK_SEED=[{"id":"nk_ignister0","name":"@ignister","color":"#7a4a3a","card
 let state={boxes:[],settings:{showValue:true}};
 const STORE_KEY='nick-collection-v1';
 function load(){try{const s=JSON.parse(localStorage.getItem(STORE_KEY));if(s&&s.boxes){state=Object.assign(state,s);return;}}catch(e){}if(typeof NICK_SEED!=='undefined'&&NICK_SEED.length){state.boxes=JSON.parse(JSON.stringify(NICK_SEED));save();}}
-function save(){localStorage.setItem(STORE_KEY,JSON.stringify(state));}
+function save(){localStorage.setItem(STORE_KEY,JSON.stringify(state));if(fbRef&&!applyingRemote)pushToFirebase();}
 
 /* =========================================================================
    Card database
@@ -338,6 +375,39 @@ function enrich(c){let r=null;if(c.cardId)r=resolveById(c.cardId);if(!r&&c.name)
   if(r){c.cardId=r.i;c.type=r.t;c.race=r.r;c.attribute=r.a;c.price=r.p;if(r.dn&&!c.name)c.name=r.dn;}return c;}
 async function enrichAll(){await ensureCardDB();if(!dbReady)return;for(const b of state.boxes)for(const c of b.cards)enrich(c);save();}
 
+/* ---- live price tracking (TCGplayer market price, via YGOPRODeck; auto-refresh once/day) ---- */
+let lastPriceStamp=0;
+function ago(ms){if(!ms)return 'never';const d=Date.now()-ms;const h=Math.floor(d/3600000);if(h<1)return 'just now';if(h<24)return h+'h ago';return Math.floor(h/24)+'d ago';}
+function reRenderAll(){updateHud();if($('#shelfOverlay').classList.contains('open'))renderShelf();if(currentBoxId){renderBoxHeader();renderCards();}}
+function pickPrice(cd){const pr=cd.card_prices&&cd.card_prices[0];if(!pr)return 0;return parseFloat(pr.tcgplayer_price)||parseFloat(pr.cardmarket_price)||parseFloat(pr.ebay_price)||0;}
+async function applyLivePrices(){let map;try{map=await idbGet('prices');}catch(e){}if(!map)return;
+  for(const b of state.boxes)for(const c of b.cards){if(c.cardId!=null&&map[c.cardId]!=null)c.price=map[c.cardId];}}
+async function refreshPricesDaily(force){
+  try{
+    lastPriceStamp=(await idbGet('priceStamp'))||0;
+    if(!force && Date.now()-lastPriceStamp < 20*3600000){await applyLivePrices();reRenderAll();return;}
+    const ids=[...new Set(state.boxes.flatMap(b=>b.cards).map(c=>c.cardId).filter(Boolean))];
+    if(!ids.length)return;
+    if(force)toast('Updating prices...');
+    let map=(await idbGet('prices'))||{}; let ok=false;
+    for(let i=0;i<ids.length;i+=40){
+      const chunk=ids.slice(i,i+40);
+      try{
+        const j=await fetch('https://db.ygoprodeck.com/api/v7/cardinfo.php?id='+chunk.join(',')).then(r=>r.json());
+        if(j&&j.data){for(const cd of j.data){const p=pickPrice(cd);map[cd.id]=p;if(cd.card_images)for(const im of cd.card_images)map[im.id]=p;}ok=true;}
+      }catch(e){}
+      await new Promise(r=>setTimeout(r,120));
+    }
+    if(!ok){ // fallback: refresh whole database (proven path) and read prices from it
+      dbReady=false; await idbSet('ver',null); await ensureCardDB();
+      if(dbReady){for(const id of ids){const rec=resolveById(id);if(rec)map[id]=rec.p;}ok=true;}
+    }
+    if(ok){await idbSet('prices',map);lastPriceStamp=Date.now();await idbSet('priceStamp',lastPriceStamp);
+      await applyLivePrices();save();reRenderAll();if(force)toast('Prices updated (TCGplayer)');}
+    else if(force)toast('Could not reach the price source');
+  }catch(e){if(force)toast('Price update failed');}
+}
+
 /* totals */
 function boxTotals(b){let count=0,value=0;for(const c of b.cards){const q=c.qty||1;count+=q;value+=(c.price||0)*q;}return{count,value,unique:b.cards.length};}
 function grandTotals(){let cards=0,unique=0,value=0;for(const b of state.boxes){const t=boxTotals(b);cards+=t.count;unique+=t.unique;value+=t.value;}return{cards,unique,value,boxes:state.boxes.length};}
@@ -361,7 +431,7 @@ const MAP=[
  "WT...........W",
  "W.UU......BB.W",
  "W.........BB.W",
- "W...P...P....W",
+ "W...P...P...XW",
  "WWWWWWWWWWWWWW",
 ];
 function tileAt(c,r){if(r<0||r>=ROWS||c<0||c>=COLS)return 'W';return MAP[r][c];}
@@ -458,7 +528,7 @@ function drawPlayer(){
 function draw(){
   ctx.clearRect(0,0,cv.width,cv.height);
   for(let r=0;r<ROWS;r++)for(let c=0;c<COLS;c++){const t=MAP[r][c];if(t==='W')drawWall(c,r);else drawFloorTile(c,r);}
-  drawRug();drawCabinet();drawDesk();drawFridge();drawGrill();drawVending();drawTV();drawCouch();drawBed();
+  drawRug();drawCabinet();drawDesk();drawFridge();drawGrill();drawVending();drawTV();drawCouch();drawBed();drawWasher();
   for(const[c,r]of cells('P'))drawPlant(c,r);
   if(cookingUntil>performance.now())drawSmoke();
   drawPlayer();drawPlumbob();
@@ -518,27 +588,28 @@ function afterAction(){save();renderNeeds();}
 function cookSteak(){if(cookingUntil>performance.now()){toast('Already grilling!');return;}
   cookingUntil=performance.now()+2000;toast('\uD83D\uDD25 Grilling a steak...');
   setTimeout(()=>{need('hunger',45);need('fun',8);state.sim.meals=(state.sim.meals||0)+1;afterAction();
-    toast("\uD83E\uDD69 Steak's ready! Nick has grilled "+state.sim.meals+" steak"+(state.sim.meals>1?'s':'')+".");},2000);}
+    toast("\uD83E\uDD69 Steak's ready! Nic has grilled "+state.sim.meals+" steak"+(state.sim.meals>1?'s':'')+".");},2000);}
 function fridgeSnack(){const f=['a sandwich \uD83E\uDD6A','cold pizza \uD83C\uDF55','an apple \uD83C\uDF4E','some cheese \uD83E\uDDC0','leftovers'][Math.floor(Math.random()*5)];
-  need('hunger',22);need('energy',4);afterAction();toast('Nick grabs '+f+' from the fridge.');}
+  need('hunger',22);need('energy',4);afterAction();toast('Nic grabs '+f+' from the fridge.');}
 function vendMenu(){showMenuCentered('VENDING MACHINE',[
   {label:'\uD83E\uDD64 Soda',fn:()=>{need('fun',14);need('hunger',6);state.sim.snacks=(state.sim.snacks||0)+1;afterAction();toast('*clunk* An ice-cold soda \uD83E\uDD64');}},
-  {label:'\uD83C\uDF6B Candy bar',fn:()=>{need('hunger',18);need('fun',6);afterAction();toast('Nick unwraps a candy bar \uD83C\uDF6B');}},
+  {label:'\uD83C\uDF6B Candy bar',fn:()=>{need('hunger',18);need('fun',6);afterAction();toast('Nic unwraps a candy bar \uD83C\uDF6B');}},
   {label:'\uD83E\uDD54 Chips',fn:()=>{need('hunger',20);afterAction();toast('*crunch* chips \uD83E\uDD54');}},
   {label:'\uD83C\uDF6A Cookies',fn:()=>{need('fun',12);need('hunger',10);afterAction();toast('A fresh pack of cookies \uD83C\uDF6A');}},
   {sp:1},{label:'Never mind',fn:closeMenu},
 ]);}
 function watchTV(){const s=['a Duel Monsters rerun','a cooking show','the big game','a nature doc','late-night cartoons','a movie marathon'][Math.floor(Math.random()*6)];
-  need('fun',30);need('energy',-4);afterAction();toast('\uD83D\uDCFA Nick kicks back and watches '+s+'.');}
-function relaxCouch(){need('fun',12);need('energy',12);need('social',5);afterAction();toast('\uD83D\uDECB\uFE0F Nick relaxes on the couch. Comfy.');}
-function waterPlant(){need('fun',6);afterAction();toast('\uD83E\uDEB4 Nick waters the plant. It perks up.');}
+  need('fun',30);need('energy',-4);afterAction();toast('\uD83D\uDCFA Nic kicks back and watches '+s+'.');}
+function relaxCouch(){need('fun',12);need('energy',12);need('social',5);afterAction();toast('\uD83D\uDECB\uFE0F Nic relaxes on the couch. Comfy.');}
+function waterPlant(){need('fun',6);afterAction();toast('\uD83E\uDEB4 Nic waters the plant. It perks up.');}
 function napBed(){const f=$('#fade');if(f)f.classList.add('on');
-  setTimeout(()=>{need('energy',100-(state.sim.energy||0));need('fun',5);afterAction();toast('\uD83D\uDE34 Nick took a nap. Fully rested!');if(f)setTimeout(()=>f.classList.remove('on'),400);},900);}
+  setTimeout(()=>{need('energy',100-(state.sim.energy||0));need('fun',5);afterAction();toast('\uD83D\uDE34 Nic took a nap. Fully rested!');if(f)setTimeout(()=>f.classList.remove('on'),400);},900);}
 const ACTIONS={C:{label:'OPEN SHELF',fn:openShelf},D:{label:'USE PC',fn:openPC},
   G:{label:'GRILL A STEAK',fn:cookSteak},V:{label:'GET A SNACK',fn:vendMenu},
   T:{label:'WATCH TV',fn:watchTV},U:{label:'RELAX',fn:relaxCouch},
   B:{label:'TAKE A NAP',fn:napBed},F:{label:'RAID THE FRIDGE',fn:fridgeSnack},
-  P:{label:'WATER PLANT',fn:waterPlant}};
+  P:{label:'WATER PLANT',fn:waterPlant},
+  X:{label:'PRESSURE WASH',fn:openWash}};
 
 /* ---- interaction ---- */
 function interact(){if(overlayOpen())return;const a=ACTIONS[frontTile().t];if(a)a.fn();}
@@ -894,9 +965,10 @@ function openPC(){
     {label:'Restore backup (JSON)',fn:importJSON},
     {sp:1},
     {label:(state.settings.showValue?'Hide':'Show')+' card values',fn:()=>{state.settings.showValue=!state.settings.showValue;save();if(currentBoxId){renderBoxHeader();renderCards();}renderShelf();}},
-    {label:'Refresh card database',fn:async()=>{dbReady=false;await idbSet('ver',null);await ensureCardDB();await enrichAll();toast('Card DB refreshed');}},
+    {label:'Update prices now (last: '+ago(lastPriceStamp)+')',fn:()=>refreshPricesDaily(true)},
+    {label:'Refresh card database',fn:async()=>{dbReady=false;await idbSet('ver',null);await ensureCardDB();await enrichAll();await applyLivePrices();save();reRenderAll();toast('Card DB refreshed');}},
     {sp:1},
-    {label:"Reset shelf to Nick's collection",fn:()=>{if(confirm("Reset the shelf back to Nick's imported collection? This clears any changes you've made here.")){state.boxes=JSON.parse(JSON.stringify(NICK_SEED));save();renderShelf();if(currentBoxId)closeBox();toast("Reset to Nick's collection");}}},
+    {label:"Reset shelf to Nic's collection",fn:()=>{if(confirm("Reset the shelf back to Nic's imported collection? This clears any changes you've made here.")){state.boxes=JSON.parse(JSON.stringify(NICK_SEED));save();renderShelf();if(currentBoxId)closeBox();toast("Reset to Nic's collection");}}},
     {sp:1},
     {label:'Close',fn:closeMenu},
   ]);
@@ -915,8 +987,78 @@ function showMenuCentered(title,items){
 /* =========================================================================
    Boot
    ========================================================================= */
+/* ================= PRESSURE WASHER MINI-GAME ================= */
+let washClean=null,washDirt=null,washCtx=null,washW=300,washH=200,washing=false,washRewarded=false,washMoves=0;
+function drawTiledSurface(cc){const b=20;for(let y=0;y<washH;y+=b)for(let x=0;x<washW;x+=b){cc.fillStyle=(((x/b)+(y/b))%2)?'#aeb8c0':'#98a2aa';cc.fillRect(x,y,b,b);}
+  cc.strokeStyle='#79838b';cc.lineWidth=1;for(let y=0;y<=washH;y+=b){cc.beginPath();cc.moveTo(0,y+.5);cc.lineTo(washW,y+.5);cc.stroke();}for(let x=0;x<=washW;x+=b){cc.beginPath();cc.moveTo(x+.5,0);cc.lineTo(x+.5,washH);cc.stroke();}}
+function washRender(){washCtx.clearRect(0,0,washW,washH);washCtx.drawImage(washClean,0,0);washCtx.drawImage(washDirt,0,0);}
+function washSpray(x,y){const dc=washDirt.getContext('2d');dc.globalCompositeOperation='destination-out';
+  dc.beginPath();dc.arc(x,y,13,0,7);dc.fill();dc.beginPath();dc.arc(x,y,8,0,7);dc.fill();dc.globalCompositeOperation='source-over';
+  washRender();washCtx.fillStyle='rgba(190,225,255,.75)';for(let i=0;i<7;i++)washCtx.fillRect((x+(Math.random()*12-6))|0,(y+(Math.random()*12-6))|0,2,2);
+  if((++washMoves%8)===0)washUpdatePct();}
+function washUpdatePct(){const dc=washDirt.getContext('2d');const d=dc.getImageData(0,0,washW,washH).data;let cl=0,tot=0;
+  for(let i=3;i<d.length;i+=160){tot++;if(d[i]<40)cl++;}const pct=Math.round(100*cl/tot);
+  const lbl=$('#washPct');if(lbl)lbl.textContent=pct+'% CLEAN'+(pct>=98?'  \u2728 SPOTLESS!':'');
+  if(pct>=98&&!washRewarded){washRewarded=true;need('fun',18);need('social',2);afterAction();toast('\u2728 Spotless! Nic loves a clean patio.');}}
+function openWash(){const cv2=$('#washCanvas');washCtx=cv2.getContext('2d');washCtx.imageSmoothingEnabled=false;washW=cv2.width;washH=cv2.height;
+  washClean=document.createElement('canvas');washClean.width=washW;washClean.height=washH;drawTiledSurface(washClean.getContext('2d'));
+  washDirt=document.createElement('canvas');washDirt.width=washW;washDirt.height=washH;const dc=washDirt.getContext('2d');
+  dc.fillStyle='#5c5341';dc.fillRect(0,0,washW,washH);
+  for(let i=0;i<3200;i++){dc.fillStyle='rgba('+(38+Math.random()*42|0)+','+(34+Math.random()*34|0)+','+(24+Math.random()*30|0)+','+(0.45+Math.random()*0.55)+')';const s=1+Math.random()*3;dc.fillRect(Math.random()*washW,Math.random()*washH,s,s);}
+  for(let i=0;i<40;i++){dc.fillStyle='rgba(60,80,40,.4)';dc.beginPath();dc.arc(Math.random()*washW,Math.random()*washH,3+Math.random()*7,0,7);dc.fill();}
+  washRewarded=false;washMoves=0;$('#washPct').textContent='0% CLEAN';
+  washRender();$('#washOverlay').classList.add('open');$('#controls').classList.add('hide');}
+function closeWash(){$('#washOverlay').classList.remove('open');if(!$('#shelfOverlay').classList.contains('open')&&!$('#boxOverlay').classList.contains('open')&&!$('#modal').classList.contains('open'))$('#controls').classList.remove('hide');}
+function washPos(e){const cv2=$('#washCanvas');const r=cv2.getBoundingClientRect();const cx=(e.touches?e.touches[0].clientX:e.clientX)-r.left;const cy=(e.touches?e.touches[0].clientY:e.clientY)-r.top;return [cx/r.width*washW, cy/r.height*washH];}
+(function(){const cv2=$('#washCanvas');if(!cv2)return;
+  const down=e=>{e.preventDefault();washing=true;const[x,y]=washPos(e);washSpray(x,y);};
+  const move=e=>{if(!washing)return;e.preventDefault();const[x,y]=washPos(e);washSpray(x,y);};
+  const up=e=>{washing=false;washUpdatePct();};
+  cv2.addEventListener('mousedown',down);cv2.addEventListener('mousemove',move);addEventListener('mouseup',up);
+  cv2.addEventListener('touchstart',down,{passive:false});cv2.addEventListener('touchmove',move,{passive:false});cv2.addEventListener('touchend',up);
+})();
+$('#washClose').onclick=closeWash;
+$('#washOverlay').addEventListener('click',e=>{if(e.target===$('#washOverlay'))closeWash();});
+function drawWasher(){for(const[c,r]of cells('X')){const x=c*T,y=r*T;
+  R(x+3,y+7,9,7,'#2a6fb0');R(x+3,y+7,9,1,'#4f90d0');R(x+3,y+13,9,1,'#1a4f80');
+  R(x+4,y+8,4,3,'#f0c020');R(x+3,y+14,3,2,'#222');R(x+9,y+14,3,2,'#222');
+  R(x+6,y+4,2,4,'#888');R(x+6,y+4,5,1,'#888');R(x+11,y+6,1,6,'#333');R(x+12,y+4,1,3,'#555');}}
+
+/* ================= FIREBASE LIVE SYNC ================= */
+let fbRef=null, applyingRemote=false, syncInit=false, pushTimer=null, lastPushJSON='';
+function setSync(s){const e=$('#sync');if(e){e.textContent=s;e.dataset.s=s;}}
+function slimBoxes(){return state.boxes.map(b=>({id:b.id,name:b.name,color:b.color,cards:(b.cards||[]).map(c=>({name:c.name,qty:c.qty,cardId:c.cardId,setCode:c.setCode,rarity:c.rarity,condition:c.condition}))}));}
+function pushToFirebase(force){
+  if(!fbRef||applyingRemote||(!syncInit&&!force))return;
+  const slim=JSON.stringify(slimBoxes());
+  if(slim===lastPushJSON&&!force)return;
+  clearTimeout(pushTimer);
+  pushTimer=setTimeout(()=>{lastPushJSON=slim;
+    fbRef.set({boxes:JSON.parse(slim),settings:{showValue:!!state.settings.showValue},updated:Date.now()})
+      .then(()=>setSync('synced')).catch(()=>setSync('offline'));},force?0:500);
+}
+function initFirebase(){
+  if(!window.firebase||!FIREBASE_CONFIG.apiKey||/PASTE/.test(FIREBASE_CONFIG.apiKey)){setSync('local');return;}
+  try{
+    firebase.initializeApp(FIREBASE_CONFIG);fbRef=firebase.database().ref(SYNC_PATH);setSync('sync..');
+    fbRef.on('value',snap=>{
+      const val=snap.val();syncInit=true;
+      if(val&&Array.isArray(val.boxes)){
+        const incoming=JSON.stringify(val.boxes);
+        if(incoming===lastPushJSON){setSync('synced');return;}
+        lastPushJSON=incoming;applyingRemote=true;
+        state.boxes=val.boxes;
+        if(val.settings&&typeof val.settings.showValue==='boolean')state.settings.showValue=val.settings.showValue;
+        localStorage.setItem(STORE_KEY,JSON.stringify(state));applyingRemote=false;
+        enrichAll().then(applyLivePrices).then(reRenderAll);reRenderAll();setSync('synced');
+      }else{pushToFirebase(true);}   // empty node: seed it
+    },err=>{setSync('offline');});
+  }catch(e){setSync('offline');}
+}
+
 load();ensureSim();renderNeeds();fit();requestAnimationFrame(loop);updateHud();
-ensureCardDB().then(()=>{if(state.boxes.length)enrichAll().then(()=>{updateHud();if(currentBoxId)renderCards();if($('#shelfOverlay').classList.contains('open'))renderShelf();});});
+ensureCardDB().then(async()=>{if(state.boxes.length){await enrichAll();await applyLivePrices();save();reRenderAll();refreshPricesDaily();}});
+initFirebase();
 </script>
 </body>
 </html>
